@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+
+<h2>Gesture Speech</h2>
+<p id="text"></p>
+
+<script>
+
+let socket = new WebSocket("ws://192.168.1.100:81/");
+
+socket.onmessage = function(event){
+
+    let msg = event.data;
+
+    document.getElementById("text").innerHTML = msg;
+
+    let speech = new SpeechSynthesisUtterance(msg);
+
+    speech.lang = "en-US";
+
+    window.speechSynthesis.speak(speech);
+}
+
+</script>
+
+</body>
+</html>
