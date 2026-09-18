@@ -1,0 +1,919 @@
+/*
+ * HandGPT v4 — ESP32-S3 Version (Instant Direct AP Mode)
+ * Pins:
+ *   SDA -> GPIO 18
+ *   SCL -> GPIO 9
+ * Multiplexer: 0x70 (TCA9548A / PCA9548A)
+ * Channels:
+ *   CH0 -> Palm      CH1 -> Middle
+ *   CH2 -> Thumb     CH3 -> Ring
+ *   CH4 -> Little    CH5 -> Index
+ *
+ * AP Mode Info:
+ *   SSID:     HandGPT-v4
+ *   PASS:     12345678
+ *   URL:      http://192.168.4.1
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <LittleFS.h>
+#include <SPIFFS.h>
+#include <math.h>
+
+// ── Access Point Configuration ────────────────────────────────────
+#define AP_SSID "HandGPT-v4"
+#define AP_PASS "12345678"
+
+// ── I2C Pins for ESP32-S3 ─────────────────────────────────────────
+#define I2C_SDA  18
+#define I2C_SCL  19
+#define PCA_ADDR 0x70
+#define MPU_ADDR 0x68
+
+// Channels: CH0–CH5
+const uint8_t CH[6] = { 0, 1, 2, 3, 4, 5 };
+const char*   NM[6] = { "Palm", "Thumb", "Index", "Middle", "Ring", "Little" };
+
+// ---- FILTERS ----
+struct Kalman {
+  float q=0.001f,r=0.05f,p=1.0f,x=0; bool init=false;
+  float update(float z){ if(!init){x=z;init=true;return z;} p+=q;float k=p/(p+r);x+=k*(z-x);p*=(1-k);return x; }
+  void reset(){ init=false; p=1.0f; }
+};
+#define MA_WIN 10
+struct MovAvg {
+  float buf[MA_WIN]={0}; int idx=0,cnt=0;
+  float update(float z){ buf[idx]=z;idx=(idx+1)%MA_WIN;if(cnt<MA_WIN)cnt++;float s=0;for(int i=0;i<cnt;i++)s+=buf[i];return s/cnt; }
+  void reset(){ idx=0;cnt=0; }
+};
+struct Comp {
+  float x=0; bool init=false;
+  float update(float z){ if(!init){x=z;init=true;return z;} x=0.85f*x+0.15f*z;return x; }
+  void reset(){ init=false; }
+};
+
+Kalman kP[6],kR[6];
+MovAvg mP[6],mR[6];
+Comp   cP[6],cR[6];
+
+float rawP[6],rawR[6],filP[6],filR[6];
+bool  sensorOK[6] = {false,false,false,false,false,false};
+int   activeFilter = 1;
+
+// ================================================================
+//  GESTURE STORAGE — KNN multi-vector
+// ================================================================
+#define MAX_GESTURES   30
+#define MAX_VECS        5   // recordings per label
+#define KNN_K           3   // neighbours to vote
+#define MAX_SAMPLES   500
+// Optional gyro support – enable by defining INCLUDE_GYRO = 1
+#define INCLUDE_GYRO 0
+#define FEAT_DIM 12
+#if INCLUDE_GYRO
+  #undef FEAT_DIM
+  #define FEAT_DIM 24  // pitch, roll, gyroX, gyroY per sensor
+#endif
+
+// Raw and filtered gyro arrays (only used when INCLUDE_GYRO == 1)
+#if INCLUDE_GYRO
+float rawG[6], filG[6]; // gyro Y axis (for simplicity we use only one gyro axis)
+#endif
+
+#define SOFTMAX_SIGMA  20.0f
+#define DS_FILE        "/hgpt.bin"
+
+struct Gesture {
+  char  label[32];
+  float vecs[MAX_VECS][FEAT_DIM];
+  int   vecCount;
+  int   lastSamples;
+  bool  used;
+};
+
+Gesture gestures[MAX_GESTURES];
+int     gestureCount = 0;
+
+static float recBuf[MAX_SAMPLES][FEAT_DIM];
+int   recCount  = 0;
+bool  recActive = false;
+char  recLabel[32] = "";
+
+// Majority vote smoothing
+#define VOTE_WIN 3
+char  voteHist[VOTE_WIN][32];
+int   voteIdx = 0;
+
+// Boot status flags
+bool  pcaFound    = false;
+int   mpuFoundCnt = 0;
+bool  wifiOK      = false;
+char  ipStr[20]   = "192.168.4.1";
+
+WebServer        http(80);
+WebSocketsServer ws(81);
+
+// ================================================================
+//  FILESYSTEM (LittleFS Primary with SPIFFS Fallback)
+// ================================================================
+bool fsOK = false;
+bool isLittleFS = false;
+
+// ------------------------------------------------
+//  Wi‑Fi AP helper – retries and error reporting
+// ------------------------------------------------
+bool startAP(){
+  const int maxAttempts = 3;
+  for(int attempt=1; attempt<=maxAttempts; ++attempt){
+    if(WiFi.softAP(AP_SSID, AP_PASS)){
+      IPAddress ip = WiFi.softAPIP();
+      snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0],ip[1],ip[2],ip[3]);
+      wifiOK = true;
+      Serial.printf("[AP] Started (attempt %d) – IP %s\n", attempt, ipStr);
+      return true;
+    }
+    Serial.printf("[AP] softAP failed (attempt %d) – retrying...\n", attempt);
+    delay(500);
+  }
+  // All attempts failed – report to UI
+  wifiOK = false;
+  if(ws.connectedClients()>0) ws.broadcastTXT("{\"type\":\"info\",\"msg\":\"AP start failed – device in AP‑only mode unavailable\"}");
+  return false;
+}
+
+void initFS(){
+  if(LittleFS.begin(true)){
+    fsOK = true;
+    isLittleFS = true;
+    Serial.println("[FS]     LittleFS mounted successfully");
+  } else if(SPIFFS.begin(true)){
+    fsOK = true;
+    isLittleFS = false;
+    Serial.println("[FS]     SPIFFS mounted successfully");
+  } else {
+    Serial.println("[FS]     ERROR: Flash filesystem mount failed!");
+  }
+}
+
+void saveDataset(){
+  if(!fsOK){ Serial.println("[FS] Save FAIL: No filesystem"); return; }
+  File f = isLittleFS ? LittleFS.open(DS_FILE,"w") : SPIFFS.open(DS_FILE,"w");
+  if(!f){ Serial.println("[FS] Save FAIL: Open file failed"); return; }
+  f.write((uint8_t*)&gestureCount, sizeof(gestureCount));
+  for(int i=0;i<gestureCount;i++) f.write((uint8_t*)&gestures[i], sizeof(Gesture));
+  f.close();
+  Serial.printf("[FS] Saved %d gestures to flash\n", gestureCount);
+}
+
+void loadDataset(){
+  if(!fsOK) return;
+  bool exists = isLittleFS ? LittleFS.exists(DS_FILE) : SPIFFS.exists(DS_FILE);
+  if(!exists){ Serial.println("[FS] No dataset file found"); return; }
+  File f = isLittleFS ? LittleFS.open(DS_FILE,"r") : SPIFFS.open(DS_FILE,"r");
+  if(!f){ Serial.println("[FS] Load FAIL: Open file failed"); return; }
+  int gc=0;
+  f.read((uint8_t*)&gc, sizeof(gc));
+  if(gc<0||gc>MAX_GESTURES){ f.close(); Serial.println("[FS] Invalid dataset file"); return; }
+  gestureCount=gc;
+  for(int i=0;i<gestureCount;i++) f.read((uint8_t*)&gestures[i], sizeof(Gesture));
+  f.close();
+  Serial.printf("[FS] Loaded %d gestures from flash\n", gestureCount);
+}
+
+// ================================================================
+//  HTML PAGE
+// ================================================================
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta charset='UTF-8'/><title>HandGPT v4 - S3</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',sans-serif;}
+header{background:#161b22;border-bottom:1px solid #21262d;padding:12px 20px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+header h1{color:#58a6ff;font-size:16px;}
+#st{margin-left:auto;font-size:12px;color:#f85149;}
+#st.on{color:#3fb950;}
+.bstat{display:flex;gap:12px;width:100%;margin-top:6px;flex-wrap:wrap;}
+.bitem{font-size:11px;padding:2px 8px;border-radius:4px;border:1px solid #30363d;background:#0d1117;}
+.bitem.ok{color:#3fb950;border-color:#3fb950;}
+.bitem.fail{color:#f85149;border-color:#f85149;}
+.bitem.warn{color:#d29922;border-color:#d29922;}
+.sdots{display:flex;gap:4px;align-items:center;}
+.sdot{width:9px;height:9px;border-radius:50%;background:#3fb950;}
+.sdot.fail{background:#f85149;}
+.sdot.unk{background:#484f58;}
+.wrap{padding:16px;max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:16px;}
+.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:16px;}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#8b949e;margin-bottom:12px;}
+.frow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;}
+.fb{padding:7px 16px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#c9d1d9;font-size:13px;font-weight:600;cursor:pointer;}
+.fb.act{background:#58a6ff;color:#000;border-color:#58a6ff;}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{color:#8b949e;padding:6px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:11px;text-transform:uppercase;}
+td{padding:7px 10px;border-bottom:1px solid #161b22;}
+.sn{font-weight:700;color:#e6edf3;}
+.rv{color:#8b949e;font-family:monospace;}
+.fv{color:#3fb950;font-family:monospace;font-weight:700;}
+.dp{color:#f0883e;font-family:monospace;font-size:12px;}
+.dn{color:#79c0ff;font-family:monospace;font-size:12px;}
+.dz{color:#484f58;font-family:monospace;font-size:12px;}
+.rrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:7px 12px;font-size:13px;outline:none;min-width:180px;}
+input:focus{border-color:#58a6ff;}
+.btn{border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;}
+.btn-g{background:#3fb950;color:#000;}
+.btn-r{background:#f85149;color:#fff;}
+.btn-y{background:#d29922;color:#000;}
+.btn-b{background:#58a6ff;color:#000;}
+.btn-p{background:#bc8cff;color:#000;}
+.btn:disabled{opacity:.4;cursor:not-allowed;}
+.del{background:#f85149;color:#fff;border:none;border-radius:4px;padding:3px 9px;font-size:11px;font-weight:600;cursor:pointer;}
+#scount{font-size:24px;font-weight:900;color:#d29922;font-family:monospace;}
+#scount.rec{animation:pulse 1s infinite;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
+.match-box{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:14px 18px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:10px;}
+.match-name{font-size:32px;font-weight:900;color:#3fb950;letter-spacing:2px;}
+.match-name.pend{color:#d29922;}
+.bar-w{flex:1;min-width:120px;background:#21262d;border-radius:4px;height:8px;}
+.bar{height:100%;background:#3fb950;border-radius:4px;transition:width .3s;}
+.rt td{padding:5px 10px;border-bottom:1px solid #161b22;font-family:monospace;font-size:12px;}
+.rt th{color:#8b949e;padding:5px 10px;font-size:11px;text-transform:uppercase;border-bottom:1px solid #21262d;}
+.best-row td{background:#1a2e1a;}
+.glbl{font-weight:700;color:#58a6ff;font-size:13px;font-family:'Segoe UI';}
+.bar-cell{width:120px;}
+.mini-bar-w{background:#21262d;border-radius:3px;height:5px;}
+.mini-bar{height:100%;background:#3fb950;border-radius:3px;transition:width .4s;}
+#cont-pill{display:inline-block;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;background:#1a2e1a;color:#3fb950;border:1px solid #3fb950;margin-left:10px;}
+#cont-pill.off{background:#0d1117;color:#484f58;border-color:#30363d;}
+.vbar{display:inline-flex;gap:2px;margin-left:6px;}
+.vbox{width:10px;height:10px;border-radius:2px;background:#30363d;}
+.vbox.on{background:#3fb950;}
+</style></head><body>
+<header>
+<span style='font-size:20px'>&#x1F590;</span>
+<h1>HandGPT v4 <span style='font-size:11px;color:#8b949e'>ESP32-S3 (AP Mode)</span></h1>
+<div class='sdots' id='sdots'>
+<span class='sdot unk' id='sd0' title='Palm'></span>
+<span class='sdot unk' id='sd1' title='Middle'></span>
+<span class='sdot unk' id='sd2' title='Thumb'></span>
+<span class='sdot unk' id='sd3' title='Ring'></span>
+<span class='sdot unk' id='sd4' title='Little'></span>
+<span class='sdot unk' id='sd5' title='Index'></span>
+</div>
+<span id='st'>&#x25CF; Disconnected</span>
+<div class='bstat'>
+<span class='bitem' id='bs-pca'>PCA: ?</span>
+<span class='bitem' id='bs-mpu'>MPU: ?/6</span>
+<span class='bitem' id='bs-wifi'>AP Mode: OK</span>
+<span class='bitem' id='bs-spiffs'>Flash: ?</span>
+</div>
+</header>
+<div class='wrap'>
+
+<!-- CARD 1 -->
+<div class='card'>
+<h2>Live Sensor Monitor</h2>
+<div class='frow'>
+<button class='fb' id='f0' onclick='setF(0)'>Raw Only</button>
+<button class='fb act' id='f1' onclick='setF(1)'>Kalman</button>
+<button class='fb' id='f2' onclick='setF(2)'>Moving Avg</button>
+<button class='fb' id='f3' onclick='setF(3)'>Complementary</button>
+</div>
+<table><thead><tr><th>Sensor</th><th>Status</th><th>Raw P</th><th>Raw R</th>
+<th id='fph'>Filtered P</th><th id='frh'>Filtered R</th>
+<th>Diff P</th><th>Diff R</th></tr></thead><tbody>
+<tr><td class='sn'>Palm</td>  <td id='ss0'>-</td><td class='rv' id='rp0'>-</td><td class='rv' id='rr0'>-</td><td class='fv' id='fp0'>-</td><td class='fv' id='fr0'>-</td><td id='dp0' class='dz'>-</td><td id='dr0' class='dz'>-</td></tr>
+<tr><td class='sn'>Thumb</td><td id='ss1'>-</td><td class='rv' id='rp1'>-</td><td class='rv' id='rr1'>-</td><td class='fv' id='fp1'>-</td><td class='fv' id='fr1'>-</td><td id='dp1' class='dz'>-</td><td id='dr1' class='dz'>-</td></tr>
+<tr><td class='sn'>Index</td> <td id='ss2'>-</td><td class='rv' id='rp2'>-</td><td class='rv' id='rr2'>-</td><td class='fv' id='fp2'>-</td><td class='fv' id='fr2'>-</td><td id='dp2' class='dz'>-</td><td id='dr2' class='dz'>-</td></tr>
+<tr><td class='sn'>Middle</td>   <td id='ss3'>-</td><td class='rv' id='rp3'>-</td><td class='rv' id='rr3'>-</td><td class='fv' id='fp3'>-</td><td class='fv' id='fr3'>-</td><td id='dp3' class='dz'>-</td><td id='dr3' class='dz'>-</td></tr>
+<tr><td class='sn'>Ring</td><td id='ss4'>-</td><td class='rv' id='rp4'>-</td><td class='rv' id='rr4'>-</td><td class='fv' id='fp4'>-</td><td class='fv' id='fr4'>-</td><td id='dp4' class='dz'>-</td><td id='dr4' class='dz'>-</td></tr>
+<tr><td class='sn'>Little</td> <td id='ss5'>-</td><td class='rv' id='rp5'>-</td><td class='rv' id='rr5'>-</td><td class='fv' id='fp5'>-</td><td class='fv' id='fr5'>-</td><td id='dp5' class='dz'>-</td><td id='dr5' class='dz'>-</td></tr>
+</tbody></table></div>
+
+<!-- CARD 2 -->
+<div class='card'>
+<h2>Record Gesture <span style='color:#484f58;font-size:11px;font-weight:400'>
+record same label up to 5 times for better accuracy</span></h2>
+<div class='rrow'>
+<input type='text' id='glbl' placeholder='Label e.g. ONE' maxlength='31'/>
+<button class='btn btn-g' id='bstart' onclick='startRec()'>&#x25CF; Start</button>
+<button class='btn btn-r' id='bstop' onclick='stopRec()' disabled>&#x25A0; Stop &amp; Save</button>
+</div>
+<div style='display:flex;align-items:center;gap:16px;'>
+<div><div style='font-size:11px;color:#8b949e;margin-bottom:2px'>SAMPLES</div>
+<div id='scount'>0</div></div>
+<div id='rec-msg' style='font-size:13px;color:#8b949e'></div>
+</div></div>
+
+<!-- CARD 3 -->
+<div class='card'>
+<h2>Gesture Recognition</h2>
+<div class='rrow'>
+<button class='btn btn-b' onclick='doCheck()'>&#x1F50D; Check Once</button>
+<button class='btn btn-p' id='btnCont' onclick='toggleCont()'>&#x25B6; Start Continuous</button>
+<span id='cont-pill' class='off'>CONTINUOUS: OFF</span>
+</div>
+<div id='match-wrap' style='display:none'>
+<div class='match-box'>
+<div><div style='font-size:11px;color:#8b949e;margin-bottom:4px'>BEST MATCH</div>
+<div class='match-name' id='match-name'>-</div>
+<div id='match-warn' style='font-size:11px;color:#d29922;margin-top:2px'></div>
+</div>
+<div style='flex:1'>
+<div style='font-size:12px;color:#8b949e;margin-bottom:4px' id='match-conf'>-</div>
+<div class='bar-w'><div class='bar' id='match-bar' style='width:0'></div></div>
+</div></div>
+<table class='rt' style='margin-top:10px'>
+<thead><tr><th>Label</th><th>Vecs</th><th>Best Dist</th><th>Confidence</th><th class='bar-cell'>Bar</th></tr></thead>
+<tbody id='match-rows'></tbody>
+</table></div></div>
+
+<!-- CARD 4 -->
+<div class='card'>
+<h2>Stored Gestures <span id='gcnt' style='color:#58a6ff'>(0)</span></h2>
+<table><thead><tr><th>Label</th><th>Recordings</th><th>Last Samples</th><th></th></tr></thead>
+<tbody id='gtb'><tr><td colspan='4' style='color:#484f58;text-align:center;padding:16px'>
+No gestures recorded yet</td></tr></tbody>
+</table></div>
+
+<!-- CARD 5 -->
+<div class='card'>
+<h2>Dataset &#x2014; Save &amp; Load
+<span id='spiffs-msg' style='font-size:11px;font-weight:400;color:#3fb950;margin-left:10px'></span></h2>
+<div class='rrow'>
+<button class='btn btn-y' onclick='exportDS()'>&#x2B07; Export JSON</button>
+<button class='btn btn-y' onclick='exportCSV()'>&#x2B07; Export CSV</button>
+<label class='btn btn-b' style='cursor:pointer'>&#x2B06; Import JSON
+<input type='file' id='imp-file' accept='.json' style='display:none' onchange='importDS(event)'/>
+</label>
+<button class='btn btn-r' onclick='clearAll()'>&#x1F5D1; Clear All</button>
+<span id='ds-msg' style='font-size:12px;color:#8b949e'></span>
+</div></div>
+
+</div>
+<script>
+var wsock,curF=1,stored_gestures=[];
+var FLBL=['Raw Only','Kalman','Moving Avg','Complementary'];
+var contMode=false,contTimer=null,lastSpoken='';
+
+function conn(){
+wsock=new WebSocket('ws://'+location.hostname+':81/');
+wsock.onopen=function(){el('st').textContent='\u25CF Connected';el('st').className='on';};
+wsock.onclose=function(){
+  el('st').textContent='\u25CF Disconnected';el('st').className='';
+  if(contTimer){clearInterval(contTimer);contTimer=null;}
+  setTimeout(conn,2000);
+};
+wsock.onmessage=function(e){
+  var d=JSON.parse(e.data);
+  if(d.type==='data')   onData(d);
+  if(d.type==='status') el('scount').textContent=d.count;
+  if(d.type==='saved')  onSaved(d);
+  if(d.type==='match')  onMatch(d);
+  if(d.type==='boot')   onBoot(d);
+  if(d.type==='info')   el('spiffs-msg').textContent=d.msg;
+};
+}
+
+function el(id){return document.getElementById(id);}
+function send(o){if(wsock&&wsock.readyState===1)wsock.send(JSON.stringify(o));}
+function fmt(v){return(v>=0?'+':'')+parseFloat(v).toFixed(1);}
+
+function onBoot(d){
+var pb=el('bs-pca'),mb=el('bs-mpu'),wb=el('bs-wifi'),fb=el('bs-spiffs');
+pb.textContent='PCA: '+(d.pca?'OK':'FAIL'); pb.className='bitem '+(d.pca?'ok':'fail');
+mb.textContent='MPU: '+d.mpuOk+'/6'; mb.className='bitem '+(d.mpuOk===6?'ok':(d.mpuOk>0?'warn':'fail'));
+wb.textContent='AP Mode: '+(d.wifi?d.ip:'FAIL'); wb.className='bitem '+(d.wifi?'ok':'fail');
+fb.textContent='Flash: '+(d.spiffs?'OK':'FAIL'); fb.className='bitem '+(d.spiffs?'ok':'fail');
+for(var i=0;i<6;i++){
+  el('sd'+i).className='sdot '+(d.sensors[i]?'':'fail');
+}
+}
+
+function setF(f){
+curF=f;
+for(var i=0;i<4;i++) el('f'+i).className='fb'+(i===f?' act':'');
+el('fph').textContent=f===0?'--':FLBL[f]+' P';
+el('frh').textContent=f===0?'--':FLBL[f]+' R';
+send({cmd:'filter',val:f});
+}
+
+function onData(d){
+for(var i=0;i<6;i++){
+  var ok=d.ok[i];
+  el('sd'+i).className='sdot'+(ok?'':' fail');
+  el('ss'+i).innerHTML=ok?'<span style="color:#3fb950">&#x2713;</span>':'<span style="color:#f85149">&#x2717;</span>';
+  el('rp'+i).textContent=ok?fmt(d.rp[i]):'--';
+  el('rr'+i).textContent=ok?fmt(d.rr[i]):'--';
+  if(curF===0||!ok){
+    el('fp'+i).textContent='-'; el('fr'+i).textContent='-';
+    el('dp'+i).textContent='-'; el('dp'+i).className='dz';
+    el('dr'+i).textContent='-'; el('dr'+i).className='dz';
+  } else {
+    el('fp'+i).textContent=fmt(d.fp[i]);
+    el('fr'+i).textContent=fmt(d.fr[i]);
+    setDiff('dp'+i,d.fp[i]-d.rp[i]);
+    setDiff('dr'+i,d.fr[i]-d.rr[i]);
+  }
+}
+}
+
+function setDiff(id,v){
+var e=el(id);
+e.textContent=(v>=0?'+':'')+v.toFixed(1);
+e.className=Math.abs(v)<0.5?'dz':(v>0?'dp':'dn');
+}
+
+function startRec(){
+var lbl=el('glbl').value.trim().toUpperCase();
+if(!lbl){el('rec-msg').textContent='Enter a label!';el('rec-msg').style.color='#f85149';return;}
+el('bstart').disabled=true; el('bstop').disabled=false;
+el('scount').className='rec';
+el('rec-msg').textContent='Recording '+lbl+'...'; el('rec-msg').style.color='#d29922';
+send({cmd:'startRec',label:lbl});
+}
+
+function stopRec(){
+el('bstart').disabled=false; el('bstop').disabled=true;
+el('scount').className='';
+el('rec-msg').textContent='Saving...'; el('rec-msg').style.color='#58a6ff';
+send({cmd:'stopRec'});
+}
+
+function onSaved(d){
+  if(d.label&&d.label!=='EMPTY'){
+    el('rec-msg').textContent='Saved: '+d.label+' (vec '+(d.vecIdx+1)+'/'+d.vecCount+', '+d.sampleCount+' samples)';
+    el('rec-msg').style.color='#3fb950';
+  }
+  el('scount').textContent='0';
+  stored_gestures=d.gestures||[]; rebuildTable();
+  if(d.total!==undefined){
+    el('ds-msg').textContent='Dataset updated: '+d.total+' gesture(s)';
+    el('ds-msg').style.color='#3fb950';
+  }
+}
+
+function doCheck(){ send({cmd:'check'}); }
+
+function toggleCont(){
+contMode=!contMode;
+if(contMode){
+  el('btnCont').textContent='\u23F9 Stop Continuous'; el('btnCont').className='btn btn-r';
+  el('cont-pill').textContent='CONTINUOUS: ON'; el('cont-pill').className='';
+  contTimer=setInterval(function(){send({cmd:'check'});},1000);
+  send({cmd:'check'});
+} else {
+  clearInterval(contTimer); contTimer=null;
+  el('btnCont').textContent='\u25B6 Start Continuous'; el('btnCont').className='btn btn-p';
+  el('cont-pill').textContent='CONTINUOUS: OFF'; el('cont-pill').className='off';
+}
+}
+
+function onMatch(d){
+el('match-wrap').style.display='';
+if(!d.found){
+  el('match-name').textContent='No gestures stored';
+  el('match-name').style.color='#f85149';
+  el('match-rows').innerHTML=''; return;
+}
+var sorted=d.all.slice().sort(function(a,b){return b.conf-a.conf;});
+var best=sorted[0];
+var stable=d.stable!==false;
+el('match-name').textContent=stable?best.label:'...';
+el('match-name').className='match-name'+(stable?'':' pend');
+el('match-warn').textContent=d.unreliable?'\u26A0 Some sensors offline':'';
+el('match-conf').textContent='Confidence: '+best.conf.toFixed(1)+'%   Dist: '+best.dist.toFixed(2)+(stable?'':' (stabilising...)');
+el('match-bar').style.width=Math.min(best.conf,100)+'%';
+if(stable&&best.conf>=55&&window.speechSynthesis&&best.label!==lastSpoken){
+  lastSpoken=best.label;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(new SpeechSynthesisUtterance(best.label));
+}
+if(best.conf<40) lastSpoken='';
+var html='';
+sorted.forEach(function(g){
+  var isBest=g.label===best.label;
+  var bw=Math.min(g.conf,100).toFixed(1)+'%';
+  html+='<tr class="'+(isBest?'best-row':'')+'"><td class="glbl">'+g.label+'</td>';
+  html+='<td>'+g.vecs+'</td><td>'+g.dist.toFixed(2)+'</td>';
+  html+='<td>'+g.conf.toFixed(1)+'%</td>';
+  html+='<td class="bar-cell"><div class="mini-bar-w"><div class="mini-bar" style="width:'+bw+'"></div></div></td></tr>';
+});
+el('match-rows').innerHTML=html;
+}
+
+function rebuildTable(){
+el('gcnt').textContent='('+stored_gestures.length+')';
+if(!stored_gestures.length){
+  el('gtb').innerHTML='<tr><td colspan=4 style="color:#484f58;text-align:center;padding:16px">No gestures recorded yet</td></tr>';
+  return;
+}
+var html='';
+stored_gestures.forEach(function(g,i){
+  html+='<tr><td class="glbl">'+g.label+'</td><td>';
+  var vb='<span class="vbar">';
+  for(var v=0;v<5;v++) vb+='<span class="vbox'+(v<g.vecCount?' on':'')+'"></span>';
+  vb+='</span>';
+  html+=vb+' '+g.vecCount+'/5</td>';
+  html+='<td>'+g.lastSamples+'</td>';
+  html+='<td><button class="del" onclick="delGesture('+i+')">Del</button></td></tr>';
+});
+el('gtb').innerHTML=html;
+}
+
+function delGesture(i){if(!confirm('Delete?'))return;send({cmd:'delete',idx:i});}
+function clearAll(){if(!confirm('Clear ALL gestures?'))return;send({cmd:'clearAll'});}
+
+function exportDS(){
+if(!stored_gestures.length){alert('No gestures stored to export.');return;}
+var b=new Blob([JSON.stringify({version:2,gestures:stored_gestures},null,2)],{type:'application/json'});
+var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='handgpt.json';a.click();
+el('ds-msg').textContent='Exported '+stored_gestures.length+' gestures.';el('ds-msg').style.color='#3fb950';
+}
+
+function exportCSV(){
+if(!stored_gestures.length){alert('No gestures stored to export.');return;}
+var rows=['label,vec,samples'];
+stored_gestures.forEach(function(g){
+  rows.push(g.label+','+g.vecCount+','+g.lastSamples);
+});
+var b=new Blob([rows.join('\n')],{type:'text/csv'});
+var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='handgpt.csv';a.click();
+el('ds-msg').textContent='Exported CSV.';el('ds-msg').style.color='#3fb950';
+}
+
+function importDS(evt){
+var file=evt.target.files[0];if(!file)return;
+var r=new FileReader();
+r.onload=function(e){
+  try{
+    var obj=JSON.parse(e.target.result);
+    var arr=obj.gestures||obj;
+    if(!Array.isArray(arr)||!arr.length)throw new Error('Empty');
+    send({cmd:'loadDataset',gestures:arr});
+    el('ds-msg').textContent='Uploading...';el('ds-msg').style.color='#d29922';
+  }catch(err){el('ds-msg').textContent='Failed: '+err.message;el('ds-msg').style.color='#f85149';}
+  el('imp-file').value='';
+};
+r.readAsText(file);
+}
+
+conn();
+</script></body></html>
+)rawliteral";
+
+// ================================================================
+//  HARDWARE
+// ================================================================
+void pcaSelect(uint8_t ch){ Wire.beginTransmission(PCA_ADDR);Wire.write(1<<ch);Wire.endTransmission(); }
+void pcaDisable(){ Wire.beginTransmission(PCA_ADDR);Wire.write(0);Wire.endTransmission(); }
+bool mpuWake(){ Wire.beginTransmission(MPU_ADDR);Wire.write(0x6B);Wire.write(0x00);return Wire.endTransmission()==0; }
+bool mpuRead(float &ax,float &ay,float &az){
+  Wire.beginTransmission(MPU_ADDR);Wire.write(0x3B);
+  if(Wire.endTransmission(false)!=0) return false;
+  if(Wire.requestFrom((uint8_t)MPU_ADDR,(uint8_t)6)<6) return false;
+  int16_t r[3];
+  for(int i=0;i<3;i++) r[i]=(int16_t)((Wire.read()<<8)|Wire.read());
+  ax=r[0]/16384.0f;ay=r[1]/16384.0f;az=r[2]/16384.0f;
+  return true;
+}
+
+void readAndFilter(){
+  for(int i=0;i<6;i++){
+    pcaSelect(CH[i]); delayMicroseconds(200);
+    float ax,ay,az;
+    bool ok=mpuRead(ax,ay,az);
+    sensorOK[i]=ok;
+    if(!ok) continue;
+    float p=atan2f(-ax,sqrtf(ay*ay+az*az))*57.2957795f;
+    float r=atan2f(ay,az)*57.2957795f;
+    rawP[i]=p; rawR[i]=r;
+    float kfp=kP[i].update(p),kfr=kR[i].update(r);
+    float mfp=mP[i].update(p),mfr=mR[i].update(r);
+    float cfp=cP[i].update(p),cfr=cR[i].update(r);
+    switch(activeFilter){
+      case 1:filP[i]=kfp;filR[i]=kfr;break;
+      case 2:filP[i]=mfp;filR[i]=mfr;break;
+      case 3:filP[i]=cfp;filR[i]=cfr;break;
+      default:filP[i]=p;filR[i]=r;break;
+    }
+  }
+  pcaDisable();
+}
+
+void resetFilters(){
+  for(int i=0;i<6;i++){ kP[i].reset();kR[i].reset();mP[i].reset();mR[i].reset();cP[i].reset();cR[i].reset(); }
+}
+
+// ================================================================
+//  GESTURE LOGIC
+// ================================================================
+void currentFeat(float f[FEAT_DIM]){
+  for(int i=0;i<6;i++){
+    f[i*2]   = sensorOK[i] ? filP[i] : 0.0f;
+    f[i*2+1] = sensorOK[i] ? filR[i] : 0.0f;
+  }
+}
+
+float euclidean(const float* a,const float* b,int n){
+  float s=0; for(int i=0;i<n;i++){float d=a[i]-b[i];s+=d*d;} return sqrtf(s);
+}
+
+bool anySensorFailed(){ for(int i=0;i<6;i++) if(!sensorOK[i]) return true; return false; }
+
+bool checkMajority(const char* lbl){
+  int c=0; for(int i=0;i<VOTE_WIN;i++) if(strcmp(voteHist[i],lbl)==0) c++; return c>=2;
+}
+
+void sendGestureList(const char* lbl, int sc, int vi, int vc = 0){
+  String msg="{\"type\":\"saved\",\"label\":\""; msg+=lbl;
+  msg+="\",\"sampleCount\":"; msg+=sc;
+  msg+=",\"vecIdx\":"; msg+=vi;
+  msg+=",\"vecCount\":"; msg+=vc;
+  msg+=",\"total\":"; msg+=gestureCount;
+  msg+=",\"gestures\":[";
+  for(int i=0;i<gestureCount;i++){
+    msg+="{\"label\":\""; msg+=gestures[i].label;
+    msg+="\",\"vecCount\":"; msg+=gestures[i].vecCount;
+    msg+=",\"lastSamples\":"; msg+=gestures[i].lastSamples;
+    msg+=",\"means\":[";
+    for(int v=0;v<gestures[i].vecCount;v++){
+      msg+="[";
+      for(int f=0;f<FEAT_DIM;f++){
+        msg+=String(gestures[i].vecs[v][f],2);
+        if(f<FEAT_DIM-1) msg+=",";
+      }
+      msg+="]";
+      if(v<gestures[i].vecCount-1) msg+=",";
+    }
+    msg+="]}";
+    if(i<gestureCount-1) msg+=",";
+  }
+  msg+="]}";
+  ws.broadcastTXT(msg);
+}
+
+void sendMatch(){
+  if(gestureCount==0){ ws.broadcastTXT("{\"type\":\"match\",\"found\":false}"); return; }
+
+  float feat[FEAT_DIM];
+  currentFeat(feat);
+
+  // Pool all vectors
+  struct N { float dist; int gi; };
+  N pool[MAX_GESTURES*MAX_VECS];
+  int ps=0;
+  for(int i=0;i<gestureCount;i++)
+    for(int v=0;v<gestures[i].vecCount;v++)
+      pool[ps++]={euclidean(feat,gestures[i].vecs[v],FEAT_DIM),i};
+
+  // Partial sort K nearest
+  int K=min(KNN_K,ps);
+  for(int k=0;k<K;k++){
+    int m=k; for(int j=k+1;j<ps;j++) if(pool[j].dist<pool[m].dist) m=j;
+    N tmp=pool[k]; pool[k]=pool[m]; pool[m]=tmp;
+  }
+
+  // Vote + best dist per gesture
+  int   votes[MAX_GESTURES]={};
+  float bestD[MAX_GESTURES];
+  for(int i=0;i<gestureCount;i++) bestD[i]=1e9f;
+  for(int k=0;k<K;k++){
+    votes[pool[k].gi]++;
+    if(pool[k].dist<bestD[pool[k].gi]) bestD[pool[k].gi]=pool[k].dist;
+  }
+
+  // Softmax
+  float scores[MAX_GESTURES], scoreSum=0;
+  for(int i=0;i<gestureCount;i++){
+    scores[i]=expf(-bestD[i]/SOFTMAX_SIGMA); scoreSum+=scores[i];
+  }
+
+  // Winner
+  int best=0;
+  for(int i=1;i<gestureCount;i++)
+    if(votes[i]>votes[best]||(votes[i]==votes[best]&&scores[i]>scores[best])) best=i;
+
+  // Majority vote smoothing
+  strncpy(voteHist[voteIdx],gestures[best].label,31);
+  voteIdx=(voteIdx+1)%VOTE_WIN;
+  bool stable=checkMajority(gestures[best].label);
+
+  String msg="{\"type\":\"match\",\"found\":true";
+  msg+=",\"stable\":"; msg+=(stable?"true":"false");
+  msg+=",\"unreliable\":"; msg+=(anySensorFailed()?"true":"false");
+  msg+=",\"all\":[";
+  for(int i=0;i<gestureCount;i++){
+    float conf=(scoreSum>0.0001f)?100.0f*scores[i]/scoreSum:0.0f;
+    msg+="{\"label\":\""; msg+=gestures[i].label;
+    msg+="\",\"dist\":";  msg+=String(bestD[i]<1e8f?bestD[i]:0,2);
+    msg+=",\"conf\":";    msg+=String(conf,1);
+    msg+=",\"vecs\":";    msg+=gestures[i].vecCount;
+    msg+=",\"votes\":";   msg+=votes[i];
+    msg+="}";
+    if(i<gestureCount-1) msg+=",";
+  }
+  msg+="]}";
+  ws.broadcastTXT(msg);
+}
+
+// Send boot status to browser once WS connects
+void sendBootStatus(){
+  String msg="{\"type\":\"boot\"";
+  msg+=",\"pca\":"; msg+=(pcaFound?"true":"false");
+  msg+=",\"mpuOk\":"; msg+=mpuFoundCnt;
+  msg+=",\"wifi\":"; msg+=(wifiOK?"true":"false");
+  msg+=",\"ip\":\""; msg+=ipStr; msg+="\"";
+  msg+=",\"spiffs\":"; msg+=(fsOK?"true":"false");
+  msg+=",\"sensors\":[";
+  for(int i=0;i<6;i++){ msg+=(sensorOK[i]?"true":"false"); if(i<5)msg+=","; }
+  msg+="]}";
+  ws.broadcastTXT(msg);
+}
+
+// ================================================================
+//  WEBSOCKET
+// ================================================================
+void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len){
+  if(type==WStype_CONNECTED){ sendBootStatus(); sendGestureList("",0,0,0); return; }
+  if(type!=WStype_TEXT) return;
+  String s=(char*)payload;
+
+  if(s.indexOf("\"cmd\":\"filter\"")>=0){
+    int idx=s.indexOf("\"val\":"); if(idx>=0){int v=s.substring(idx+6).toInt();if(v>=0&&v<=3){activeFilter=v;resetFilters();}}
+    return;
+  }
+
+  if(s.indexOf("\"cmd\":\"startRec\"")>=0){
+    int li=s.indexOf("\"label\":\""); strncpy(recLabel,"UNKNOWN",31);
+    if(li>=0){int st=li+9,en=s.indexOf("\"",st);String l=s.substring(st,en);l.toUpperCase();strncpy(recLabel,l.c_str(),31);recLabel[31]=0;}
+    recCount=0; recActive=true;
+    Serial.printf("[REC] Start: %s\n",recLabel);
+    return;
+  }
+
+  if(s.indexOf("\"cmd\":\"stopRec\"")>=0){
+    recActive=false;
+    Serial.printf("[REC] Stop received. Total recCount = %d\n", recCount);
+    if(recCount==0){
+      Serial.println("[REC] WARNING: recCount is 0! No samples recorded.");
+      ws.sendTXT(num,"{\"type\":\"saved\",\"label\":\"EMPTY\",\"sampleCount\":0,\"vecIdx\":0,\"vecCount\":0,\"total\":0,\"gestures\":[]}");
+      return;
+    }
+    float mean[FEAT_DIM]={};
+    for(int si=0;si<recCount;si++) for(int f=0;f<FEAT_DIM;f++) mean[f]+=recBuf[si][f];
+    for(int f=0;f<FEAT_DIM;f++) mean[f]/=recCount;
+    int slot=-1;
+    for(int i=0;i<gestureCount;i++) if(strcasecmp(gestures[i].label,recLabel)==0){slot=i;break;}
+    if(slot<0){
+      if(gestureCount>=MAX_GESTURES){Serial.println("[REC] Full!");return;}
+      slot=gestureCount++;
+      strncpy(gestures[slot].label,recLabel,31);
+      gestures[slot].vecCount=0; gestures[slot].used=true;
+    }
+    int vi=gestures[slot].vecCount<MAX_VECS?gestures[slot].vecCount:MAX_VECS-1;
+    if(gestures[slot].vecCount<MAX_VECS) gestures[slot].vecCount++;
+    memcpy(gestures[slot].vecs[vi],mean,sizeof(mean));
+    gestures[slot].lastSamples=recCount;
+    Serial.printf("[REC] Saved %s vec%d: %d samples\n",recLabel,vi,recCount);
+    saveDataset();
+    sendGestureList(recLabel,recCount,vi,gestures[slot].vecCount);
+    recCount=0; return;
+  }
+
+  if(s.indexOf("\"cmd\":\"check\"")>=0){ sendMatch(); return; }
+
+  if(s.indexOf("\"cmd\":\"clearAll\"")>=0){
+    gestureCount=0; memset(gestures,0,sizeof(gestures)); saveDataset(); sendGestureList("",0,0,0); return;
+  }
+
+  if(s.indexOf("\"cmd\":\"delete\"")>=0){
+    int ii=s.indexOf("\"idx\":"); if(ii>=0){
+      int idx=s.substring(ii+6).toInt();
+      if(idx>=0&&idx<gestureCount){for(int i=idx;i<gestureCount-1;i++) gestures[i]=gestures[i+1];gestureCount--;}
+    }
+    saveDataset(); sendGestureList("",0,0,0); return;
+  }
+
+  if(s.indexOf("\"cmd\":\"loadDataset\"")>=0){
+    gestureCount=0;
+    int arrStart=s.indexOf("\"gestures\":["); if(arrStart<0) return;
+    arrStart+=12; int pos=arrStart;
+    while(gestureCount<MAX_GESTURES){
+      int ob=s.indexOf("{",pos); if(ob<0) break;
+      int li=s.indexOf("\"label\":\"",ob); if(li<0) break;
+      int ls=li+9,le=s.indexOf("\"",ls);
+      String lbl=s.substring(ls,le); lbl.toUpperCase();
+      strncpy(gestures[gestureCount].label,lbl.c_str(),31);
+      int vc=s.indexOf("\"vecCount\":",ob);
+      int vecCount=(vc>=0&&vc<ob+2000)?s.substring(vc+11).toInt():1;
+      if(vecCount<1)vecCount=1; if(vecCount>MAX_VECS)vecCount=MAX_VECS;
+      int ms=s.indexOf("\"means\":[[",ob);
+      if(ms>=0&&ms<ob+2000){
+        ms+=9; gestures[gestureCount].vecCount=0;
+        for(int vi=0;vi<vecCount;vi++){
+          int me=s.indexOf("]",ms); if(me<0) break;
+          String marr=s.substring(ms,me);
+          int fi=0,mi2=0;
+          while(fi<FEAT_DIM && mi2 < (int)marr.length()){
+            int comma=marr.indexOf(',',mi2);
+            if(comma<0) comma=marr.length();
+            gestures[gestureCount].vecs[vi][fi]=marr.substring(mi2,comma).toFloat();
+            fi++; mi2=comma+1;
+          }
+          gestures[gestureCount].vecCount++;
+          ms=me+2;
+        }
+      }
+      gestures[gestureCount].lastSamples=100;
+      gestures[gestureCount].used=true;
+      gestureCount++;
+      pos=s.indexOf("}",ob)+1;
+    }
+    saveDataset(); sendGestureList("",0,0,0); return;
+  }
+}
+
+// ================================================================
+//  SETUP & LOOP
+// ================================================================
+void setup(){
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n--- HandGPT v4 ESP32-S3 Initialising ---");
+
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+
+  // PCA check
+  Wire.beginTransmission(PCA_ADDR);
+  pcaFound = (Wire.endTransmission() == 0);
+  Serial.printf("[I2C] PCA9548A: %s\n", pcaFound ? "FOUND" : "NOT FOUND");
+
+  // MPU check across channels
+  mpuFoundCnt = 0;
+  for(int i=0;i<6;i++){
+    pcaSelect(CH[i]); delayMicroseconds(200);
+    bool ok = mpuWake();
+    sensorOK[i] = ok;
+    if(ok) mpuFoundCnt++;
+    Serial.printf("[I2C] CH%d (%s): %s\n", CH[i], NM[i], ok ? "MPU OK" : "FAIL");
+  }
+  pcaDisable();
+
+  initFS();
+  loadDataset();
+
+  // AP setup
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0],ip[1],ip[2],ip[3]);
+  wifiOK = true;
+  Serial.printf("[AP]  SSID: %s | IP: %s\n", AP_SSID, ipStr);
+
+  http.on("/", [](){ http.send(200, "text/html", PAGE); });
+  http.begin();
+
+  ws.begin();
+  ws.onEvent(wsEvent);
+
+  Serial.println("--- System Ready ---");
+}
+
+void loop(){
+  http.handleClient();
+  ws.loop();
+
+  static unsigned long lastSensor = 0;
+  if(millis() - lastSensor >= 30){
+    lastSensor = millis();
+    readAndFilter();
+
+    if(recActive && recCount < MAX_SAMPLES){
+      currentFeat(recBuf[recCount]);
+      recCount++;
+    }
+
+    static unsigned long lastBcast = 0;
+    if(millis() - lastBcast >= 100){
+      lastBcast = millis();
+      String msg = "{\"type\":\"data\"";
+      msg += ",\"ok\":[";
+      for(int i=0;i<6;i++){ msg += (sensorOK[i]?"true":"false"); if(i<5)msg+=","; }
+      msg += "],\"rp\":[";
+      for(int i=0;i<6;i++){ msg += String(rawP[i],1); if(i<5)msg+=","; }
+      msg += "],\"rr\":[";
+      for(int i=0;i<6;i++){ msg += String(rawR[i],1); if(i<5)msg+=","; }
+      msg += "],\"fp\":[";
+      for(int i=0;i<6;i++){ msg += String(filP[i],1); if(i<5)msg+=","; }
+      msg += "],\"fr\":[";
+      for(int i=0;i<6;i++){ msg += String(filR[i],1); if(i<5)msg+=","; }
+      msg += "]}";
+      ws.broadcastTXT(msg);
+    }
+  }
+}
